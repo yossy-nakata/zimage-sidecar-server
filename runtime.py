@@ -1,7 +1,7 @@
 """Single-GPU inference runtime: Z-Image-Turbo BF16 + canonical Sidecar + INT8 text encoder.
 
-Production experiment for RTX 3090.  No package installation or silent fallback.
-The known-good BF16 pipeline/Sidecar and prompt template remain unchanged.
+Optional fixed LoRA support for transformer-side LoRAs (e.g. anatomy / body fixes).
+The LoRA is loaded once at startup from config.json and remains active for all requests.
 """
 from __future__ import annotations
 
@@ -21,9 +21,6 @@ from safetensors.torch import load_file
 
 from sidecar import IdentitySidecar
 
-
-# A validated bitsandbytes 0.50.x script reported this notice once per INT8 matmul.
-# Suppress *only* this known cast notice, not unrelated bnb warnings/errors.
 _BNB_CAST_NOTICE = r"^MatMul8bitLt: inputs will be cast from torch\..* to float16 during quantization$"
 
 
@@ -49,7 +46,6 @@ def _require_file(path: str | Path, label: str) -> Path:
 
 
 def _validate_request(prompt: str, width: int, height: int, steps: int, seed: int, scale: float) -> None:
-    # Match server.py's existing API constraints even if runtime is called directly.
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 5000:
         raise ValueError('prompt must be nonempty and at most 5000 characters')
     if any(isinstance(v, bool) or not isinstance(v, int) for v in (width, height)):
@@ -107,6 +103,7 @@ class SidecarRuntime:
         self.pipe = None
         self.tokenizer = None
         self.text_encoder = None
+        self.active_lora_info = None
 
         print(f'[runtime] GPU={torch.cuda.get_device_name(0)}; bitsandbytes={bnb_version}', flush=True)
         _gpu_memory('before models')
@@ -123,7 +120,6 @@ class SidecarRuntime:
         self.text_encoder.eval()
         self.text_encoder.requires_grad_(False)
 
-        # Confirm quantization actually happened and no CPU/meta model weights were left behind.
         quantized_linears = sum(isinstance(m, bnb.nn.Linear8bitLt) for m in self.text_encoder.modules())
         if quantized_linears == 0:
             raise RuntimeError('Text encoder loaded but has zero bitsandbytes Linear8bitLt modules; not INT8')
@@ -165,9 +161,7 @@ class SidecarRuntime:
         if config['sidecar_rank'] != 512 or config['identity_tokens'] != 8:
             raise ValueError('Sidecar rank/tokens mismatch from validated 512/8 architecture')
 
-        self.sidecar = IdentitySidecar(
-            dim, config['sidecar_rank'], config['identity_tokens'], layers, layer_scales,
-        ).to(device=self.device, dtype=torch.float32)
+        self.sidecar = IdentitySidecar(dim, config['sidecar_rank'], config['identity_tokens'], layers, layer_scales).to(device=self.device, dtype=torch.float32)
         self.sidecar.load_state_dict(load_file(str(config['sidecar_path']), device='cpu'), strict=True)
         self.sidecar.eval()
         self.sidecar.requires_grad_(False)
@@ -182,7 +176,6 @@ class SidecarRuntime:
         transformer.requires_grad_(False)
         transformer.to(self.device)
         transformer.eval()
-        self.sidecar.attach(transformer)
 
         vae = AutoencoderKL.from_pretrained(
             clean_snapshot / 'vae',
@@ -192,30 +185,79 @@ class SidecarRuntime:
         ).to(self.device)
         vae.eval()
         vae.requires_grad_(False)
-        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            clean_snapshot / 'scheduler', local_files_only=True,
-        )
-        self.pipe = ZImagePipeline(
-            scheduler=scheduler, vae=vae, text_encoder=None, tokenizer=None, transformer=transformer,
-        )
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(clean_snapshot / 'scheduler', local_files_only=True)
+        self.pipe = ZImagePipeline(scheduler=scheduler, vae=vae, text_encoder=None, tokenizer=None, transformer=transformer)
+
+        self._load_optional_lora(transformer)
+        self.sidecar.attach(transformer)
         _gpu_memory('models ready (idle)')
-        print('[ready] models loaded; no silent INT8 fallback', flush=True)
+        msg = '[ready] models loaded; no silent INT8 fallback'
+        if self.active_lora_info:
+            msg += f"; lora={self.active_lora_info['name']} scale={self.active_lora_info['scale']}"
+        print(msg, flush=True)
+
+    def _load_optional_lora(self, transformer) -> None:
+        lora = self.config.get('lora')
+        if not lora:
+            return
+        if not isinstance(lora, dict):
+            raise ValueError('config.lora must be an object')
+        enabled = bool(lora.get('enabled', False))
+        if not enabled:
+            return
+        path = _require_file(lora.get('path', ''), 'LoRA weights')
+        adapter_name = str(lora.get('adapter_name', 'bodyfix')).strip() or 'bodyfix'
+        scale = lora.get('scale', 0.3)
+        if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale) or not (0.0 <= float(scale) <= 2.0):
+            raise ValueError('config.lora.scale must be finite and between 0.0 and 2.0')
+        scale = float(scale)
+        print(f'[lora] loading transformer LoRA: path={path} adapter={adapter_name} scale={scale}', flush=True)
+
+        last_exc = None
+        loaded = False
+        # Preferred: pipeline-level loading, then set active adapter scale.
+        if hasattr(self.pipe, 'load_lora_weights'):
+            try:
+                self.pipe.load_lora_weights(str(path), adapter_name=adapter_name)
+                if hasattr(self.pipe, 'set_adapters'):
+                    self.pipe.set_adapters(adapter_name, adapter_weights=[scale])
+                loaded = True
+            except Exception as exc:
+                last_exc = exc
+                print(f'[lora] pipeline.load_lora_weights failed: {exc!r}', flush=True)
+
+        # Fallback: transformer-level adapter loading, if exposed by this diffusers build.
+        if (not loaded) and hasattr(transformer, 'load_lora_adapter'):
+            try:
+                transformer.load_lora_adapter(str(path), adapter_name=adapter_name)
+                if hasattr(transformer, 'set_adapters'):
+                    transformer.set_adapters(adapter_name, adapter_weights=[scale])
+                loaded = True
+            except Exception as exc:
+                last_exc = exc
+                print(f'[lora] transformer.load_lora_adapter failed: {exc!r}', flush=True)
+
+        if not loaded:
+            raise RuntimeError(
+                'Failed to load LoRA with this diffusers build. '\
+                'Tried pipeline.load_lora_weights and transformer.load_lora_adapter.'
+            ) from last_exc
+
+        self.active_lora_info = {'name': adapter_name, 'path': str(path), 'scale': scale}
+        _gpu_memory('after lora')
+        print('[lora] active', flush=True)
 
     @torch.no_grad()
     def encode_prompt(self, prompt: str) -> torch.Tensor:
         t0 = time.perf_counter()
-        # Preserve comparison script's exact prompt format and hidden state selection.
         text = self.tokenizer.apply_chat_template(
             [{'role': 'user', 'content': prompt}],
             tokenize=False, add_generation_prompt=True, enable_thinking=True,
         )
-        toks = self.tokenizer(
-            [text], padding='max_length', max_length=512, truncation=True, return_tensors='pt',
-        )
+        toks = self.tokenizer([text], padding='max_length', max_length=512, truncation=True, return_tensors='pt')
         ids = toks.input_ids.to(self.device)
         mask = toks.attention_mask.to(self.device).bool()
         hidden = self.text_encoder(input_ids=ids, attention_mask=mask, output_hidden_states=True).hidden_states[-2]
-        # bitsandbytes matmuls use FP16; Z-Image prompt embeddings remain BF16.
         emb = hidden[0][mask[0]].detach().to(self.device, dtype=self.dtype).contiguous()
         if emb.ndim != 2 or emb.shape[1] != 2560 or emb.shape[0] < 1:
             raise ValueError(f'unexpected text embedding shape: {tuple(emb.shape)}')
@@ -227,7 +269,6 @@ class SidecarRuntime:
 
     @torch.no_grad()
     def generate(self, *, prompt: str, width: int, height: int, steps: int, seed: int, scale: float) -> bytes:
-        # HTTP server already serializes calls; ensure direct callers cannot skip validation.
         _validate_request(prompt, width, height, steps, seed, scale)
         torch.cuda.reset_peak_memory_stats(self.device)
         try:
@@ -257,6 +298,5 @@ class SidecarRuntime:
             _gpu_memory('CUDA OOM')
             raise RuntimeError('CUDA OOM during INT8 inference; generation failed (no hidden CPU fallback). Check VRAM and restart if necessary') from exc
         finally:
-            # Prevent the hook from retaining active request context after an exception.
             if self.sidecar is not None:
                 self.sidecar.set_context(self.identity, 0, 0.0)

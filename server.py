@@ -9,6 +9,7 @@ import json
 import math
 import os
 import secrets
+import socket
 import sys
 import threading
 import time
@@ -50,12 +51,10 @@ def parse_generation_request(obj: object, config: dict) -> dict:
         seed = secrets.randbits(32)
     elif isinstance(seed, bool) or not isinstance(seed, int) or not (0 <= seed < 2**63):
         raise ValueError('seed must be a nonnegative integer below 2^63')
-    # Refuse unsupported settings instead of silently producing a different result.
     unsupported = set(obj) - {'model', 'prompt', 'n', 'response_format', 'size', 'steps', 'sidecar_scale', 'seed'}
     if unsupported:
         raise ValueError('unsupported fields: ' + ', '.join(sorted(unsupported)))
-    return {'prompt': prompt, 'width': width, 'height': height,
-            'steps': steps, 'seed': seed, 'scale': float(scale)}
+    return {'prompt': prompt, 'width': width, 'height': height, 'steps': steps, 'seed': seed, 'scale': float(scale)}
 
 
 def build_handler(runtime, config: dict, token: str):
@@ -82,8 +81,13 @@ def build_handler(runtime, config: dict, token: str):
             if not self.authorized():
                 return
             if self.path == '/health':
-                self.send_json(200, {'status': 'ready', 'model': config['model_name'],
-                                     'gpu': 'cuda', 'busy': lock.locked()})
+                self.send_json(200, {
+                    'status': 'ready',
+                    'model': config['model_name'],
+                    'gpu': 'cuda',
+                    'busy': lock.locked(),
+                    'lora': getattr(runtime, 'active_lora_info', None),
+                })
             elif self.path == '/v1/models':
                 self.send_json(200, {'object': 'list', 'data': [{
                     'id': config['model_name'], 'object': 'model', 'owned_by': 'local',
@@ -121,12 +125,19 @@ def build_handler(runtime, config: dict, token: str):
                 self.log_error('generation failed: %s', sys.exc_info()[1])
                 import traceback
                 traceback.print_exc()
-                self.send_json(500, {'error': {'message': 'generation failed; check server logs',
-                                               'type': 'server_error'}})
+                self.send_json(500, {'error': {'message': 'generation failed; check server logs', 'type': 'server_error'}})
             finally:
                 lock.release()
 
     return Handler
+
+
+class DualStackHTTPServer(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
 
 
 def main() -> None:
@@ -143,7 +154,7 @@ def main() -> None:
     from runtime import SidecarRuntime
     runtime = SidecarRuntime(config, args.snapshot)
     port = int(os.environ.get('PORT', '8000'))
-    httpd = ThreadingHTTPServer(('0.0.0.0', port), build_handler(runtime, config, token))
+    httpd = DualStackHTTPServer(('::', port), build_handler(runtime, config, token))
     print(f'[http] listening on 0.0.0.0:{port}', flush=True)
     try:
         httpd.serve_forever()

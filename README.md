@@ -13,7 +13,7 @@ RTX 3090 24GB、既存の Python/uv/CUDA Docker 環境用。**Docker イメー�
 ## 準備
 
 1. この5ファイルを **自分のGitHubリポジトリ** に配置する（公開コード可、秘密鍵・重みは含めない）。
-2. `bootstrap.sh` の `https://github.com/yossy-nakata/zimage-sidecar-server.git` の **`yossy-nakata` を実際のGitHub owner名に置換**する。リポジトリ名が異なるならそこも合わせて変更する。未作成のリポジトリは作成する必要がある。
+2. `bootstrap.sh` の `https://github.com/REPLACE_OWNER/zimage-sidecar-server.git` の **`REPLACE_OWNER` を実際のGitHub owner名に置換**する。リポジトリ名が異なるならそこも合わせて変更する。未作成のリポジトリは作成する必要がある。
 3. R2の次の2ファイルを確認する（存在はまだ実機で未検証）。
    - `r2:nana-storage/zimage-sidecar/identity/character-v3.safetensors`
    - `r2:nana-storage/zimage-sidecar/runs/sidecar-n40-turbo-mix-v1/sidecar-step-006000.safetensors`
@@ -25,7 +25,7 @@ RTX 3090 24GB、既存の Python/uv/CUDA Docker 環境用。**Docker イメー�
 Pod の start command は、GitHub に push した後、例えば次の形にする（実際の owner に置換）。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yossy-nakata/zimage-sidecar-server/main/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/REPLACE_OWNER/zimage-sidecar-server/main/bootstrap.sh | bash
 ```
 
 既存コンテナ内に `/workspace/sidecar-server/server.py` が存在する場合、bootstrapはローカルコードをそのまま使うので、GitHub未公開の動作確認も可能です。
@@ -72,3 +72,26 @@ PY
 - `/health` と `/v1/models` も **Bearer認証必須**。
 - これは **API/構文・契約テストまで** の初期パッケージ。Z-Image-TurboとSidecar実モデルを使った3090上の生成確認は未実施。初回実機検証でAPIへの出力とVRAM使用量、text encoding時間を測定する。
 - `SIDECAR_API_KEY` をログや GitHub に出さないこと。APIはPodのTLS入口側から公開すること。
+
+
+## Optional LoRA (v0.2)
+
+This version can load **one fixed transformer-side LoRA** at startup.
+
+1. Place the LoRA file on the container at a path such as `/workspace/loras/hands-feet-skin.safetensors`.
+2. Edit `config.json`:
+
+```json
+"lora": {
+  "enabled": true,
+  "path": "/workspace/loras/hands-feet-skin.safetensors",
+  "adapter_name": "bodyfix",
+  "scale": 0.3
+}
+```
+
+Notes:
+- This is intended for **body / anatomy / hands / pose** LoRAs.
+- Only one LoRA is loaded in v0.2.
+- The LoRA is loaded once at startup and remains active for all requests.
+- `/health` now returns the active LoRA info.

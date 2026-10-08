@@ -13,5 +13,11 @@
     "height": 1024,
     "steps": 9,
     "sidecar_scale": 0.8
+  },
+  "lora": {
+    "enabled": false,
+    "path": "/workspace/loras/hands-feet-skin.safetensors",
+    "adapter_name": "bodyfix",
+    "scale": 0.3
   }
 }
