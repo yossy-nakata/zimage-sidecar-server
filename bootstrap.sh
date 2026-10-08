@@ -29,7 +29,7 @@ PY
 
 # When using a fresh Pod, clone public GitHub code. Replace REPLACE_OWNER before publishing.
 if [[ ! -f /workspace/sidecar-server/server.py ]]; then
-  git clone --depth 1 https://github.com/REPLACE_OWNER/zimage-sidecar-server.git /workspace/sidecar-server
+  git clone --depth 1 https://github.com/yossy-nakata/zimage-sidecar-server.git /workspace/sidecar-server
 fi
 for f in server.py runtime.py sidecar.py config.json; do
   [[ -f "/workspace/sidecar-server/$f" ]] || { echo "ERROR: missing $f" >&2; exit 1; }
