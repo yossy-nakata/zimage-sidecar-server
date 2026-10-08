@@ -13,7 +13,7 @@ RTX 3090 24GB、既存の Python/uv/CUDA Docker 環境用。**Docker イメー�
 ## 準備
 
 1. この5ファイルを **自分のGitHubリポジトリ** に配置する（公開コード可、秘密鍵・重みは含めない）。
-2. `bootstrap.sh` の `https://github.com/REPLACE_OWNER/zimage-sidecar-server.git` の **`REPLACE_OWNER` を実際のGitHub owner名に置換**する。リポジトリ名が異なるならそこも合わせて変更する。未作成のリポジトリは作成する必要がある。
+2. `bootstrap.sh` の `https://github.com/yossy-nakata/zimage-sidecar-server.git` の **`yossy-nakata` を実際のGitHub owner名に置換**する。リポジトリ名が異なるならそこも合わせて変更する。未作成のリポジトリは作成する必要がある。
 3. R2の次の2ファイルを確認する（存在はまだ実機で未検証）。
    - `r2:nana-storage/zimage-sidecar/identity/character-v3.safetensors`
    - `r2:nana-storage/zimage-sidecar/runs/sidecar-n40-turbo-mix-v1/sidecar-step-006000.safetensors`
@@ -25,7 +25,7 @@ RTX 3090 24GB、既存の Python/uv/CUDA Docker 環境用。**Docker イメー�
 Pod の start command は、GitHub に push した後、例えば次の形にする（実際の owner に置換）。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/REPLACE_OWNER/zimage-sidecar-server/main/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/yossy-nakata/zimage-sidecar-server/main/bootstrap.sh | bash
 ```
 
 既存コンテナ内に `/workspace/sidecar-server/server.py` が存在する場合、bootstrapはローカルコードをそのまま使うので、GitHub未公開の動作確認も可能です。
