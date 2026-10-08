@@ -1,0 +1,17 @@
+{
+  "model_name": "zimage-sidecar-n40-step6000",
+  "base_revision": "f332072aa78be7aecdf3ee76d5c247082da564a6",
+  "sidecar_path": "/workspace/models/sidecar-step-006000.safetensors",
+  "identity_path": "/workspace/identity/character-v3.safetensors",
+  "identity_fingerprint_sha256": "ff4f8106ce18ef44f14fcbf1bc246f7a20eab7a252498a731eadae497fb10bc7",
+  "sidecar_rank": 512,
+  "identity_tokens": 8,
+  "injection_layers_0based": [5, 15],
+  "layer_scales": [0.25, 1.5],
+  "defaults": {
+    "width": 1024,
+    "height": 1024,
+    "steps": 9,
+    "sidecar_scale": 0.8
+  }
+}
