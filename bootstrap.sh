@@ -17,7 +17,7 @@ export PIP_REQUIRE_VIRTUALENV=true
   echo 'ERROR: expected /usr/local/bin/python' >&2
   exit 1
 }
-for cmd in git rclone; do
+for cmd in curl tar rclone; do
   command -v "$cmd" >/dev/null || { echo "ERROR: missing $cmd" >&2; exit 1; }
 done
 python - <<'PY'
@@ -27,9 +27,11 @@ print('GPU:', torch.cuda.get_device_name(0))
 print('torch:', torch.__version__, 'diffusers:', diffusers.__version__, 'transformers:', transformers.__version__)
 PY
 
-# When using a fresh Pod, clone public GitHub code. Replace REPLACE_OWNER before publishing.
+# On a fresh Pod, fetch the public GitHub source archive (no git required).
 if [[ ! -f /workspace/sidecar-server/server.py ]]; then
-  git clone --depth 1 https://github.com/REPLACE_OWNER/zimage-sidecar-server.git /workspace/sidecar-server
+  mkdir -p /workspace/sidecar-server
+  curl -fsSL https://github.com/yossy-nakata/zimage-sidecar-server/archive/refs/heads/main.tar.gz \
+    | tar -xz -C /workspace/sidecar-server --strip-components=1
 fi
 for f in server.py runtime.py sidecar.py config.json; do
   [[ -f "/workspace/sidecar-server/$f" ]] || { echo "ERROR: missing $f" >&2; exit 1; }

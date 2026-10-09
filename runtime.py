@@ -104,6 +104,9 @@ class SidecarRuntime:
         self.tokenizer = None
         self.text_encoder = None
         self.active_lora_info = None
+        self.transformer_precision = config.get('transformer_precision', 'bf16')
+        if self.transformer_precision not in ('bf16', 'int8'):
+            raise ValueError("transformer_precision must be 'bf16' or 'int8'")
 
         print(f'[runtime] GPU={torch.cuda.get_device_name(0)}; bitsandbytes={bnb_version}', flush=True)
         _gpu_memory('before models')
@@ -166,16 +169,44 @@ class SidecarRuntime:
         self.sidecar.eval()
         self.sidecar.requires_grad_(False)
 
-        print('[model] loading clean Z-Image-Turbo BF16 transformer on GPU', flush=True)
-        transformer = ZImageTransformer2DModel.from_pretrained(
-            clean_snapshot / 'transformer',
-            dtype=self.dtype,
-            local_files_only=True,
-            low_cpu_mem_usage=True,
-        )
-        transformer.requires_grad_(False)
-        transformer.to(self.device)
-        transformer.eval()
+        if self.transformer_precision == 'bf16':
+            # Preserve the already validated BF16 loading path without modification.
+            print('[model] loading clean Z-Image-Turbo BF16 transformer on GPU', flush=True)
+            transformer = ZImageTransformer2DModel.from_pretrained(
+                clean_snapshot / 'transformer',
+                dtype=self.dtype,
+                local_files_only=True,
+                low_cpu_mem_usage=True,
+            )
+            transformer.requires_grad_(False)
+            transformer.to(self.device)
+            transformer.eval()
+        else:
+            # Ported from zimage-sidecar_code_validate_sidecar8_turbo.py.
+            # Diffusers and Transformers expose different BitsAndBytesConfig classes.
+            from diffusers import BitsAndBytesConfig as DiffusersBitsAndBytesConfig
+
+            print('[model] loading clean Z-Image-Turbo INT8 transformer on GPU', flush=True)
+            transformer = ZImageTransformer2DModel.from_pretrained(
+                clean_snapshot,
+                subfolder='transformer',
+                quantization_config=DiffusersBitsAndBytesConfig(load_in_8bit=True),
+                dtype=self.dtype,
+                device_map='cuda',
+                local_files_only=True,
+            )
+            transformer.requires_grad_(False)
+            transformer.eval()
+            # No .to(self.device) on the INT8 model: quantized weights are placed by from_pretrained().
+            count = sum(isinstance(m, bnb.nn.Linear8bitLt) for m in transformer.modules())
+            if count == 0:
+                raise RuntimeError('Turbo INT8 requested but no Linear8bitLt layers were loaded')
+            misplaced = [name for name, p in transformer.named_parameters()
+                         if p.device.type != 'cuda' or p.device.index not in (None, 0)]
+            if misplaced:
+                raise RuntimeError(f'Turbo INT8 parameters are not all on cuda:0: {misplaced[:3]}')
+            print(f'[model] confirmed Turbo INT8 Linear layers={count}; device=cuda:0', flush=True)
+            _gpu_memory('after INT8 transformer')
 
         vae = AutoencoderKL.from_pretrained(
             clean_snapshot / 'vae',
@@ -191,7 +222,7 @@ class SidecarRuntime:
         self._load_optional_lora(transformer)
         self.sidecar.attach(transformer)
         _gpu_memory('models ready (idle)')
-        msg = '[ready] models loaded; no silent INT8 fallback'
+        msg = f'[ready] models loaded; transformer={self.transformer_precision}; no silent INT8 fallback'
         if self.active_lora_info:
             msg += f"; lora={self.active_lora_info['name']} scale={self.active_lora_info['scale']}"
         print(msg, flush=True)
