@@ -233,47 +233,69 @@ class SidecarRuntime:
             return
         if not isinstance(lora, dict):
             raise ValueError('config.lora must be an object')
-        enabled = bool(lora.get('enabled', False))
-        if not enabled:
+        if not lora.get('enabled', False):
             return
+
         path = _require_file(lora.get('path', ''), 'LoRA weights')
         adapter_name = str(lora.get('adapter_name', 'bodyfix')).strip() or 'bodyfix'
         scale = lora.get('scale', 0.3)
-        if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale) or not (0.0 <= float(scale) <= 2.0):
+        if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale) or not 0.0 <= scale <= 2.0:
             raise ValueError('config.lora.scale must be finite and between 0.0 and 2.0')
         scale = float(scale)
-        print(f'[lora] loading transformer LoRA: path={path} adapter={adapter_name} scale={scale}', flush=True)
+        print(f'[lora] loading path={path} adapter={adapter_name} scale={scale}', flush=True)
 
-        last_exc = None
-        loaded = False
-        # Preferred: pipeline-level loading, then set active adapter scale.
-        if hasattr(self.pipe, 'load_lora_weights'):
-            try:
-                self.pipe.load_lora_weights(str(path), adapter_name=adapter_name)
-                if hasattr(self.pipe, 'set_adapters'):
-                    self.pipe.set_adapters(adapter_name, adapter_weights=[scale])
-                loaded = True
-            except Exception as exc:
-                last_exc = exc
-                print(f'[lora] pipeline.load_lora_weights failed: {exc!r}', flush=True)
+        # Inspect keys without loading the entire safetensors file.
+        from safetensors import safe_open
+        from peft.tuners.tuners_utils import BaseTunerLayer
+        with safe_open(str(path), framework='pt', device='cpu') as file:
+            has_alpha = any(k.endswith('.alpha') for k in file.keys())
 
-        # Fallback: transformer-level adapter loading, if exposed by this diffusers build.
-        if (not loaded) and hasattr(transformer, 'load_lora_adapter'):
-            try:
-                transformer.load_lora_adapter(str(path), adapter_name=adapter_name)
-                if hasattr(transformer, 'set_adapters'):
-                    transformer.set_adapters(adapter_name, adapter_weights=[scale])
-                loaded = True
-            except Exception as exc:
-                last_exc = exc
-                print(f'[lora] transformer.load_lora_adapter failed: {exc!r}', flush=True)
+        if has_alpha:
+            # Some Z-Image LoRAs include per-layer .alpha tensors. The pipeline
+            # loader rejects these as unconsumed keys. Preserve their values as
+            # network_alphas instead of discarding them or changing their scale.
+            raw = load_file(str(path), device='cpu')
+            weights = {}
+            alphas = {}
+            for key, value in raw.items():
+                key = key.removeprefix('transformer.')
+                if key.endswith('.alpha'):
+                    if value.numel() != 1 or not math.isfinite(float(value.item())):
+                        raise ValueError(f'invalid LoRA alpha: {key}')
+                    alphas['transformer.' + key] = float(value.item())
+                elif '.lora_A.' in key or '.lora_B.' in key:
+                    weights['transformer.' + key] = value
+                else:
+                    raise ValueError(f'unsupported LoRA tensor: {key}')
+            a_targets = {k.removesuffix('.lora_A.weight') for k in weights if k.endswith('.lora_A.weight')}
+            b_targets = {k.removesuffix('.lora_B.weight') for k in weights if k.endswith('.lora_B.weight')}
+            if not a_targets or a_targets != b_targets:
+                raise ValueError('LoRA A/B weights are missing or unpaired')
+            if any(k.removesuffix('.alpha') not in a_targets for k in alphas):
+                raise ValueError('LoRA alpha does not match a LoRA A/B pair')
+            expected_layers = len(a_targets)
+            transformer.load_lora_adapter(
+                weights, adapter_name=adapter_name, prefix='transformer', network_alphas=alphas,
+            )
+            transformer.set_adapters(adapter_name, weights=[scale])
+            del raw, weights
+        else:
+            # Keep the already working path for ordinary Z-Image LoRAs.
+            self.pipe.load_lora_weights(str(path), adapter_name=adapter_name)
+            self.pipe.set_adapters(adapter_name, adapter_weights=[scale])
+            expected_layers = None
 
-        if not loaded:
-            raise RuntimeError(
-                'Failed to load LoRA with this diffusers build. '\
-                'Tried pipeline.load_lora_weights and transformer.load_lora_adapter.'
-            ) from last_exc
-
+        # Fail closed: successful API calls do not necessarily mean weights
+        # were actually attached to the Transformer.
+        layers = [m for m in transformer.modules()
+                  if isinstance(m, BaseTunerLayer) and adapter_name in getattr(m, 'lora_A', {})]
+        if not layers:
+            raise RuntimeError(f'LoRA {adapter_name!r} has zero loaded Transformer layers')
+        if expected_layers is not None and len(layers) != expected_layers:
+            raise RuntimeError(f'LoRA incomplete: loaded {len(layers)} of {expected_layers} layers')
+        if any(adapter_name not in getattr(m, 'active_adapters', []) for m in layers):
+            raise RuntimeError('LoRA injected but not activated')
+        print(f'[lora] verified active Transformer layers={len(layers)}', flush=True)
         self.active_lora_info = {'name': adapter_name, 'path': str(path), 'scale': scale}
         _gpu_memory('after lora')
         print('[lora] active', flush=True)
