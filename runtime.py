@@ -71,6 +71,121 @@ def _gpu_memory(label: str) -> None:
     )
 
 
+def _convert_original_zimage_lora(raw: dict, transformer) -> dict:
+    """Convert original Z-Image LoRA names to Diffusers transformer module names.
+
+    Only A/B pairs plus matching alpha are accepted. Fused QKV B weights are
+    split against the actual Diffusers model dimensions; no guessed shapes.
+    """
+    from collections import defaultdict
+
+    modules = dict(transformer.named_modules())
+    pairs = defaultdict(dict)
+
+    def normalized_key(key):
+        for prefix in ('transformer.', 'model.diffusion_model.', 'diffusion_model.'):
+            if key.startswith(prefix):
+                key = key[len(prefix):]
+                break
+        key = key.replace('.lora_A.default.weight', '.lora_A.weight')
+        key = key.replace('.lora_B.default.weight', '.lora_B.weight')
+        key = key.replace('.attention.to.q.', '.attention.to_q.')
+        key = key.replace('.attention.to.k.', '.attention.to_k.')
+        key = key.replace('.attention.to.v.', '.attention.to_v.')
+        key = key.replace('.adaLN.modulation.', '.adaLN_modulation.')
+        key = key.replace('.feed.forward.', '.feed_forward.')
+        return key
+
+    suffixes = {'.lora_A.weight': 'A', '.lora_B.weight': 'B',
+                '.lora_down.weight': 'A', '.lora_up.weight': 'B',
+                '.lora.down.weight': 'A', '.lora.up.weight': 'B',
+                '.alpha': 'alpha'}
+    for key, value in raw.items():
+        k = normalized_key(key)
+        match = next(((s, t) for s, t in suffixes.items() if k.endswith(s)), None)
+        if not match:
+            raise ValueError(f'unsupported LoRA tensor key: {key}')
+        suffix, field = match
+        target = k[:-len(suffix)]
+        if field in pairs[target]:
+            raise ValueError(f'duplicate LoRA tensor: {target}.{field}')
+        pairs[target][field] = value
+
+    # Normalize known original-module aliases *after* parsing so duplicate
+    # out/to_out and qkv/to_qkv can be identified rather than overwritten.
+    canonical = defaultdict(dict)
+    for target, values in pairs.items():
+        dest = target
+        if dest.endswith('.attention.out'):
+            dest = dest[:-len('.attention.out')] + '.attention.to_out.0'
+        elif dest.endswith('.attention.to_out'):
+            dest += '.0'
+        if dest in canonical:
+            # Some files store the alpha under the Diffusers path and its A/B
+            # tensors under the original path. Merge only complementary keys;
+            # never silently override a conflicting tensor.
+            old = canonical[dest]
+            if any(f in old and not torch.equal(old[f], t) for f, t in values.items()):
+                raise ValueError(f'conflicting LoRA aliases: {target} -> {dest}')
+            old.update(values)
+        else:
+            canonical[dest] = values
+
+    # A combined QKV LoRA can be split into individual projections. If all three
+    # individual LoRAs also exist, accept the duplicate fused form only when
+    # no other tensors need it (common in non-diffusers exports).
+    for target in list(canonical):
+        if not target.endswith('.attention.qkv'):
+            continue
+        stem = target[:-3]  # e.g. layers.0.attention.
+        dests = [stem + x for x in ('to_q', 'to_k', 'to_v')]
+        vals = canonical.pop(target)
+        if all(k in canonical for k in dests):
+            continue  # redundant original fused representation
+        if any(k in canonical for k in dests):
+            raise ValueError(f'partially duplicated fused QKV: {target}')
+        if 'A' not in vals or 'B' not in vals:
+            raise ValueError(f'fused QKV A/B missing: {target}')
+        a, b = vals['A'], vals['B']
+        if a.ndim != 2 or b.ndim != 2 or a.shape[0] != b.shape[1]:
+            raise ValueError(f'fused QKV rank mismatch: {target}')
+        if any(k not in modules for k in dests):
+            raise ValueError(f'Z-Image QKV targets missing: {dests}')
+        outdims = [int(modules[k].weight.shape[0]) for k in dests]
+        if b.shape[0] != sum(outdims):
+            raise ValueError(f'fused QKV output size mismatch at {target}: {b.shape[0]} vs {outdims}')
+        for k, part in zip(dests, torch.split(b, outdims, dim=0)):
+            canonical[k] = {'A': a, 'B': part, **({'alpha': vals['alpha']} if 'alpha' in vals else {})}
+
+    if not canonical:
+        raise ValueError('LoRA contains no compatible transformer targets')
+    converted = {}
+    for target, vals in canonical.items():
+        if set(vals) not in ({'A', 'B'}, {'A', 'B', 'alpha'}):
+            raise ValueError(f'LoRA A/B weights missing at {target}: {set(vals)}')
+        if target not in modules or not hasattr(modules[target], 'weight'):
+            raise ValueError(f'LoRA target not in Diffusers Z-Image transformer: {target}')
+        a, b = vals['A'], vals['B']
+        weight = modules[target].weight
+        if a.ndim != 2 or b.ndim != 2 or a.shape[0] != b.shape[1] or \
+                a.shape[1] != weight.shape[1] or b.shape[0] != weight.shape[0]:
+            raise ValueError(f'LoRA shape mismatch at {target}: A{tuple(a.shape)} B{tuple(b.shape)} '
+                             f'base{tuple(weight.shape)}')
+        if 'alpha' in vals:
+            alpha = vals['alpha']
+            if alpha.numel() != 1 or not math.isfinite(float(alpha.item())) or float(alpha.item()) <= 0:
+                raise ValueError(f'invalid alpha at {target}')
+            # Diffusers / PEFT expect alpha/rank. Fold this into A/B while
+            # preserving precision and keeping the PEFT configured scale=1.
+            factor = float(alpha.item()) / float(a.shape[0])
+            root = math.sqrt(factor)
+            a = (a.float() * root).to(a.dtype)
+            b = (b.float() * root).to(b.dtype)
+        converted[f'transformer.{target}.lora_A.weight'] = a
+        converted[f'transformer.{target}.lora_B.weight'] = b
+    return converted
+
+
 class SidecarRuntime:
     def __init__(self, config: dict, clean_snapshot: Path):
         from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler, ZImagePipeline, ZImageTransformer2DModel
@@ -244,58 +359,45 @@ class SidecarRuntime:
         scale = float(scale)
         print(f'[lora] loading path={path} adapter={adapter_name} scale={scale}', flush=True)
 
-        # Inspect keys without loading the entire safetensors file.
         from safetensors import safe_open
         from peft.tuners.tuners_utils import BaseTunerLayer
         with safe_open(str(path), framework='pt', device='cpu') as file:
             has_alpha = any(k.endswith('.alpha') for k in file.keys())
 
+        expected_modules = None
         if has_alpha:
-            # Some Z-Image LoRAs include per-layer .alpha tensors. The pipeline
-            # loader rejects these as unconsumed keys. Preserve their values as
-            # network_alphas instead of discarding them or changing their scale.
+            # Original Z-Image and Diffusers use different module paths and
+            # fused QKV vs separate Q/K/V. Convert before touching the model;
+            # a bad checkpoint must never leave a partially installed adapter.
             raw = load_file(str(path), device='cpu')
-            weights = {}
-            alphas = {}
-            for key, value in raw.items():
-                key = key.removeprefix('transformer.')
-                if key.endswith('.alpha'):
-                    if value.numel() != 1 or not math.isfinite(float(value.item())):
-                        raise ValueError(f'invalid LoRA alpha: {key}')
-                    alphas['transformer.' + key] = float(value.item())
-                elif '.lora_A.' in key or '.lora_B.' in key:
-                    weights['transformer.' + key] = value
-                else:
-                    raise ValueError(f'unsupported LoRA tensor: {key}')
-            a_targets = {k.removesuffix('.lora_A.weight') for k in weights if k.endswith('.lora_A.weight')}
-            b_targets = {k.removesuffix('.lora_B.weight') for k in weights if k.endswith('.lora_B.weight')}
-            if not a_targets or a_targets != b_targets:
-                raise ValueError('LoRA A/B weights are missing or unpaired')
-            if any(k.removesuffix('.alpha') not in a_targets for k in alphas):
-                raise ValueError('LoRA alpha does not match a LoRA A/B pair')
-            expected_layers = len(a_targets)
-            transformer.load_lora_adapter(
-                weights, adapter_name=adapter_name, prefix='transformer', network_alphas=alphas,
-            )
+            weights = _convert_original_zimage_lora(raw, transformer)
+            del raw
+            expected_modules = {k.removeprefix('transformer.').removesuffix('.lora_A.weight')
+                                for k in weights if k.endswith('.lora_A.weight')}
+            print(f'[lora] remapped targets={len(expected_modules)}', flush=True)
+            transformer.load_lora_adapter(weights, adapter_name=adapter_name, prefix='transformer')
             transformer.set_adapters(adapter_name, weights=[scale])
-            del raw, weights
+            del weights
         else:
-            # Keep the already working path for ordinary Z-Image LoRAs.
+            # Preserve the proven path for ordinary LoRAs without per-layer alpha.
             self.pipe.load_lora_weights(str(path), adapter_name=adapter_name)
             self.pipe.set_adapters(adapter_name, adapter_weights=[scale])
-            expected_layers = None
 
-        # Fail closed: successful API calls do not necessarily mean weights
-        # were actually attached to the Transformer.
-        layers = [m for m in transformer.modules()
-                  if isinstance(m, BaseTunerLayer) and adapter_name in getattr(m, 'lora_A', {})]
-        if not layers:
+        active = {name: mod for name, mod in transformer.named_modules()
+                  if isinstance(mod, BaseTunerLayer) and adapter_name in getattr(mod, 'lora_A', {})}
+        if not active:
             raise RuntimeError(f'LoRA {adapter_name!r} has zero loaded Transformer layers')
-        if expected_layers is not None and len(layers) != expected_layers:
-            raise RuntimeError(f'LoRA incomplete: loaded {len(layers)} of {expected_layers} layers')
-        if any(adapter_name not in getattr(m, 'active_adapters', []) for m in layers):
+        if expected_modules is not None and set(active) != expected_modules:
+            missing = sorted(expected_modules - set(active))
+            extra = sorted(set(active) - expected_modules)
+            raise RuntimeError(f'LoRA target mismatch: missing={missing[:5]}, extra={extra[:5]}')
+        if any(adapter_name not in getattr(m, 'active_adapters', []) for m in active.values()):
             raise RuntimeError('LoRA injected but not activated')
-        print(f'[lora] verified active Transformer layers={len(layers)}', flush=True)
+        if any(not math.isclose(float(m.scaling[adapter_name]),
+                                float(m.lora_alpha[adapter_name]) / float(m.r[adapter_name]) * scale,
+                                rel_tol=1e-5, abs_tol=1e-6) for m in active.values()):
+            raise RuntimeError('LoRA adapter scale was not applied')
+        print(f'[lora] verified active Transformer layers={len(active)}', flush=True)
         self.active_lora_info = {'name': adapter_name, 'path': str(path), 'scale': scale}
         _gpu_memory('after lora')
         print('[lora] active', flush=True)
