@@ -17,9 +17,10 @@ export PIP_REQUIRE_VIRTUALENV=true
   echo 'ERROR: expected /usr/local/bin/python' >&2
   exit 1
 }
-for cmd in curl tar rclone; do
+for cmd in curl tar rclone uv; do
   command -v "$cmd" >/dev/null || { echo "ERROR: missing $cmd" >&2; exit 1; }
 done
+uv pip install bitsandbytes peft datasets
 python - <<'PY'
 import torch, diffusers, transformers, safetensors, huggingface_hub
 assert torch.cuda.is_available(), 'CUDA is required'
@@ -38,7 +39,7 @@ for f in server.py runtime.py sidecar.py config.json; do
 done
 python -m py_compile /workspace/sidecar-server/{server,runtime,sidecar}.py
 
-mkdir -p /root/.config/rclone /workspace/identity /workspace/models "$HF_HOME"
+mkdir -p /root/.config/rclone /workspace/identity /workspace/models /workspace/loras "$HF_HOME"
 cat > /root/.config/rclone/rclone.conf <<EOF
 [r2]
 type = s3
@@ -57,6 +58,10 @@ if [[ ! -f /workspace/models/sidecar-step-006000.safetensors ]]; then
   rclone copyto r2:nana-storage/zimage-sidecar/runs/sidecar-n40-turbo-mix-v1/sidecar-step-006000.safetensors \
     /workspace/models/sidecar-step-006000.safetensors --retries 3 --low-level-retries 10
 fi
+
+# Download the LoRA files from R2. Existing unchanged files are skipped.
+rclone copy r2:nana-storage/zimage-sidecar/loras /workspace/loras \
+  --retries 3 --low-level-retries 10
 
 # No Training Adapter and no train-mix: inference always uses Clean Turbo.
 export SIDECAR_CLEAN_SNAPSHOT="$(python - <<'PY'
